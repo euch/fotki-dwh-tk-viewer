@@ -1,9 +1,9 @@
 import io
 import json
 import os
+import subprocess
 import threading
 import tkinter as tk
-from datetime import datetime
 from tkinter import ttk, scrolledtext, Menu, messagebox
 
 import psycopg2
@@ -83,9 +83,21 @@ class MediaBrowser:
         self.disk_label_display = ttk.Label(open_frame, text=self.current_disk_label, width=5)
         self.disk_label_display.pack(side=tk.LEFT, padx=5)
 
-        self.show_in_folder_button = ttk.Button(open_frame, text="Show in folder",
-                                                command=self.open_file, state="disabled")
+        self.show_in_folder_button = ttk.Button(
+            open_frame,
+            text="Show in folder",
+            command=self.open_file,
+            state="disabled"
+        )
         self.show_in_folder_button.pack(side=tk.LEFT, padx=5)
+
+        self.open_in_viewer_button = ttk.Button(
+            open_frame,
+            text="Open in default viewer",
+            command=self.open_in_default_viewer,
+            state="disabled"
+        )
+        self.open_in_viewer_button.pack(side=tk.LEFT, padx=5)
 
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
@@ -163,7 +175,7 @@ class MediaBrowser:
         self.paned_window.sashpos(0, 400)
 
         self.tree.bind('<<TreeviewSelect>>', self.on_select)
-        self.tree.bind('<Double-1>', self.on_double_click)
+        # Убрана привязка двойного клика
 
     def on_filter_changed(self):
         self.hide_no_preview = self.hide_no_preview_var.get()
@@ -241,19 +253,6 @@ class MediaBrowser:
         self.thumbnail_photos.clear()
         self.tree.delete(*self.tree.get_children())
         self.load_images(initial_load=True)
-
-    def reload_data(self):
-        if not self.conn:
-            self.status_var.set("Not connected to database")
-            return
-
-        self.current_offset = 0
-        self.has_more_data = True
-        self.thumbnail_cache.clear()
-        self.thumbnail_photos.clear()
-        self.tree.delete(*self.tree.get_children())
-        self.load_images(initial_load=True)
-        self.status_var.set("Data reloaded")
 
     def try_connect(self):
         if self.connect_db():
@@ -367,12 +366,47 @@ class MediaBrowser:
         else:
             self.status_var.set("No file available")
 
-    def open_explorer(self):
+    def open_in_default_viewer(self):
+        """Открывает файл в программе просмотра по умолчанию"""
         if hasattr(self, 'selected_rel_filename') and self.selected_rel_filename:
             win_path = os.path.join(self.current_disk_label, self.selected_rel_filename).replace('/', '\\')
-            self.open_explorer_for_file(win_path)
+
+            if os.path.exists(win_path):
+                try:
+                    if os.name == 'nt':
+                        os.startfile(win_path)
+                    elif os.name == 'posix':
+                        subprocess.Popen(['xdg-open', win_path])
+                    else:
+                        subprocess.Popen(['open', win_path])  # macOS
+
+                    self.status_var.set(f"Opened in default viewer: {win_path}")
+                except Exception as e:
+                    self.status_var.set(f"Error opening in viewer: {str(e)}")
+            else:
+                self.status_var.set(f"Path not found: {win_path}")
         else:
             self.status_var.set("No file available")
+
+    def open_explorer(self):
+        win_path = os.path.join(self.current_disk_label, self.selected_rel_filename).replace('/', '\\')
+        if os.path.exists(win_path):
+            try:
+                subprocess.Popen(f'explorer /select,"{win_path}"')
+                self.status_var.set(f"Opened explorer: {win_path}")
+            except Exception as e:
+                self.status_var.set(f"Error opening explorer: {str(e)}")
+        else:
+            self.status_var.set(f"Path not found: {win_path}")
+
+    def reload_data(self):
+        self.current_offset = 0
+        self.has_more_data = True
+        self.thumbnail_cache.clear()
+        self.thumbnail_photos.clear()
+        self.tree.delete(*self.tree.get_children())
+        self.load_images(initial_load=True)
+        self.status_var.set("Data reloaded")
 
     def clear_cache(self):
         self.thumbnail_cache.clear()
@@ -385,25 +419,57 @@ class MediaBrowser:
         if float(args[1]) > 0.9 and not self.is_loading and self.has_more_data:
             self.load_more_data()
 
+    def apply_exif_orientation(self, image, exif_json):
+        if not exif_json:
+            return image
+
+        try:
+            if isinstance(exif_json, str):
+                exif_dict = json.loads(exif_json)
+            else:
+                exif_dict = exif_json
+
+            # Common orientation keys
+            orientation_keys = ['Image Orientation']
+
+            orientation = None
+
+            # First try direct keys
+            for key in orientation_keys:
+                if key in exif_dict:
+                    orientation = exif_dict[key]
+                    break
+
+            if orientation:
+                if orientation == 'Rotated 90 CW':
+                    return image.rotate(-90, expand=True)
+                if orientation == 'Rotated 90 CCW':
+                    return image.rotate(90, expand=True)
+                if orientation == 'Horizontal (normal)':
+                    return image
+                print(f"Unknown orientation value: {orientation}")
+                return image
+
+        except Exception as e:
+            print(f"Error applying EXIF orientation: {e}")
+
+        return image
+
     def create_thumbnail(self, preview_data, size=(30, 30), exif_json=None):
         """Создает миниатюру изображения с учетом EXIF ориентации"""
         if not preview_data:
             return None
 
         try:
-            # Используем кэш если есть
             cache_key = f"{hash(preview_data)}_{size[0]}_{size[1]}_{str(exif_json)}"
             if cache_key in self.thumbnail_cache:
                 return self.thumbnail_cache[cache_key]
 
-            # Создаем изображение
             image = Image.open(io.BytesIO(preview_data))
 
-            # Apply EXIF orientation if available
             if exif_json:
                 image = self.apply_exif_orientation(image, exif_json)
 
-            # Сохраняем пропорции
             img_width, img_height = image.size
             ratio = min(size[0] / img_width, size[1] / img_height)
             new_width = int(img_width * ratio)
@@ -411,10 +477,8 @@ class MediaBrowser:
 
             resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-            # Создаем PhotoImage
             photo = ImageTk.PhotoImage(resized_image)
 
-            # Сохраняем в кэш
             self.thumbnail_cache[cache_key] = photo
 
             return photo
@@ -433,26 +497,19 @@ class MediaBrowser:
             for row in rows:
                 abs_filename, rel_filename, preview, caption, exif = row
 
-                # If hiding images without previews and this image has no preview, skip it
                 if self.hide_no_preview and preview is None:
                     continue
 
-                # Создаем миниатюру с учетом EXIF ориентации
                 thumbnail = self.create_thumbnail(preview, exif_json=exif) if preview else None
 
-                # Вставляем в дерево с изображением
                 item_id = self.tree.insert('', tk.END,
                                            text='',
                                            values=(rel_filename,),
                                            iid=abs_filename)
 
-                # Устанавливаем изображение для элемента
                 if thumbnail:
                     self.tree.item(item_id, image=thumbnail)
                     self.thumbnail_photos[abs_filename] = thumbnail
-                else:
-                    # Optionally show a placeholder or leave empty
-                    pass
 
                 images_loaded += 1
 
@@ -461,7 +518,6 @@ class MediaBrowser:
 
             total_count = len(self.tree.get_children())
 
-            # Build status text
             status_parts = []
             status_parts.append(f"Loaded {total_count} images")
 
@@ -480,6 +536,29 @@ class MediaBrowser:
             self.is_loading = False
             self.status_var.set(f"Error updating treeview: {str(e)}")
 
+    def parse_exif_data(self, exif_json):
+        if not exif_json:
+            return []
+
+        try:
+            exif_data = []
+
+            if isinstance(exif_json, str):
+                exif_dict = json.loads(exif_json)
+            else:
+                exif_dict = exif_json
+
+            for key, value in exif_dict.items():
+                if value not in (None, '', []):
+                    display_key = key.replace('_', ' ').title()
+                    exif_data.append((display_key, str(value)))
+
+            return exif_data
+
+        except Exception as e:
+            print(f"Error parsing EXIF: {e}")
+            return [("Ошибка парсинга", str(e))]
+
     def update_exif_panel(self, exif_json):
         for item in self.exif_tree.get_children():
             self.exif_tree.delete(item)
@@ -495,22 +574,24 @@ class MediaBrowser:
 
     def on_select(self, event):
         selection = self.tree.selection()
-        if not selection or not self.conn:
+        if not selection:
             self.show_in_folder_button.config(state="disabled")
+            self.open_in_viewer_button.config(state="disabled")
             return
 
         abs_filename = selection[0]
         self.selected_abs_filename = abs_filename
         self.show_in_folder_button.config(state="normal")
+        self.open_in_viewer_button.config(state="normal")
 
         def load_preview_in_thread():
             try:
                 cur = self.conn.cursor()
                 cur.execute("""
-                    SELECT rel_filename, preview, latest_caption, exif 
-                    FROM dm.images_collection 
-                    WHERE abs_filename = %s
-                """, (abs_filename,))
+                        SELECT rel_filename, preview, latest_caption, exif 
+                        FROM dm.images_collection 
+                        WHERE abs_filename = %s
+                    """, (abs_filename,))
                 result = cur.fetchone()
                 cur.close()
 
@@ -520,7 +601,6 @@ class MediaBrowser:
 
                     if preview:
                         image = Image.open(io.BytesIO(preview))
-                        # Apply EXIF orientation to preview image
                         if exif:
                             image = self.apply_exif_orientation(image, exif)
                         self.root.after(0, self.update_preview, image, caption, abs_filename, exif)
@@ -588,702 +668,4 @@ class MediaBrowser:
 
         self.preview_canvas.image = photo
 
-    def on_double_click(self, event):
-        """Handle double click on tree item"""
-        selection = self.tree.selection()
-        if selection:
-            # Get the absolute filename from the tree item ID
-            abs_filename = selection[0]
-            self.show_full_image(abs_filename)
-
-    def show_full_image(self, filename):
-        """Show full image from filesystem with auto-resizing"""
-        try:
-            # First get the relative filename from database
-            cur = self.conn.cursor()
-            cur.execute("""
-                SELECT rel_filename, preview, exif 
-                FROM dm.images_collection 
-                WHERE abs_filename = %s
-            """, (filename,))
-            result = cur.fetchone()
-            cur.close()
-
-            if not result:
-                self.status_var.set(f"Image not found in database: {filename}")
-                return
-
-            rel_filename, preview_data, exif = result
-
-            # Build filesystem path
-            if hasattr(self, 'current_disk_label') and self.current_disk_label:
-                filesystem_path = os.path.join(self.current_disk_label, rel_filename).replace('/', '\\')
-            else:
-                filesystem_path = rel_filename
-
-            # Check if file exists
-            if not os.path.exists(filesystem_path):
-                self.status_var.set(f"File not found: {filesystem_path}")
-
-                # Fallback to preview from database if available
-                if preview_data:
-                    self.show_full_image_from_preview(filename, preview_data, exif, rel_filename)
-                else:
-                    messagebox.showerror("File Not Found",
-                                         f"Cannot find file:\n{filesystem_path}\n\n"
-                                         f"Check if disk {self.current_disk_label} is available.")
-                return
-
-            # Open image from filesystem
-            try:
-                image = Image.open(filesystem_path)
-
-                # Apply EXIF orientation if available
-                if exif:
-                    image = self.apply_exif_orientation(image, exif)
-
-                # Create window
-                top = tk.Toplevel(self.root)
-                top.title(f"Full Size - {os.path.basename(filesystem_path)}")
-
-                # Get screen dimensions
-                screen_width = top.winfo_screenwidth()
-                screen_height = top.winfo_screenheight()
-
-                # Calculate initial window size (80% of screen, but not larger than image)
-                img_width, img_height = image.size
-                max_width = int(screen_width * 0.8)
-                max_height = int(screen_height * 0.8)
-
-                # If image is larger than screen, scale it down
-                if img_width > max_width or img_height > max_height:
-                    ratio = min(max_width / img_width, max_height / img_height)
-                    initial_width = int(img_width * ratio)
-                    initial_height = int(img_height * ratio)
-                    top.geometry(
-                        f"{initial_width}x{initial_height}+{int((screen_width - initial_width) / 2)}+{int((screen_height - initial_height) / 2)}")
-                else:
-                    # Window size = image size + some padding for controls
-                    top.geometry(
-                        f"{img_width}x{img_height + 100}+{int((screen_width - img_width) / 2)}+{int((screen_height - img_height) / 2)}")
-
-                # Store references
-                top._image = image  # Original image
-                top._current_image = image  # Currently displayed image (may be resized)
-                top._zoom_level = 1.0  # Current zoom level
-                top._pan_start_x = 0
-                top._pan_start_y = 0
-                top._pan_x = 0
-                top._pan_y = 0
-
-                # Create main frame
-                main_frame = ttk.Frame(top)
-                main_frame.pack(fill=tk.BOTH, expand=True)
-
-                # Create canvas with scrollbars
-                canvas_frame = ttk.Frame(main_frame)
-                canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-                canvas = tk.Canvas(canvas_frame, bg='gray20', highlightthickness=0)
-                v_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
-                h_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=canvas.xview)
-
-                canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
-
-                # Grid layout for canvas and scrollbars
-                canvas.grid(row=0, column=0, sticky='nsew')
-                v_scrollbar.grid(row=0, column=1, sticky='ns')
-                h_scrollbar.grid(row=1, column=0, sticky='ew')
-
-                canvas_frame.grid_rowconfigure(0, weight=1)
-                canvas_frame.grid_columnconfigure(0, weight=1)
-
-                # Store canvas reference
-                top._canvas = canvas
-                top._photo = None  # Will store the PhotoImage
-
-                # Control panel
-                control_frame = ttk.Frame(main_frame)
-                control_frame.pack(fill=tk.X, padx=5, pady=2)
-
-                # Zoom controls
-                zoom_frame = ttk.Frame(control_frame)
-                zoom_frame.pack(side=tk.LEFT, padx=5)
-
-                ttk.Button(zoom_frame, text="−", width=3,
-                           command=lambda: self.zoom_image(top, 0.8)).pack(side=tk.LEFT, padx=2)
-                ttk.Button(zoom_frame, text="Fit", width=4,
-                           command=lambda: self.fit_to_window(top)).pack(side=tk.LEFT, padx=2)
-                ttk.Button(zoom_frame, text="1:1", width=4,
-                           command=lambda: self.actual_size(top)).pack(side=tk.LEFT, padx=2)
-                ttk.Button(zoom_frame, text="+", width=3,
-                           command=lambda: self.zoom_image(top, 1.25)).pack(side=tk.LEFT, padx=2)
-
-                # Zoom label
-                self.zoom_label_var = tk.StringVar(value="100%")
-                zoom_label = ttk.Label(zoom_frame, textvariable=self.zoom_label_var, width=6)
-                zoom_label.pack(side=tk.LEFT, padx=5)
-                top._zoom_label = self.zoom_label_var
-
-                # Action buttons
-                action_frame = ttk.Frame(control_frame)
-                action_frame.pack(side=tk.RIGHT, padx=5)
-
-                ttk.Button(action_frame, text="Open in viewer",
-                           command=lambda: self.open_in_default_viewer(filesystem_path)).pack(side=tk.LEFT, padx=2)
-                ttk.Button(action_frame, text="Show in folder",
-                           command=lambda: self.open_explorer_for_file(filesystem_path)).pack(side=tk.LEFT, padx=2)
-                ttk.Button(action_frame, text="Close",
-                           command=top.destroy).pack(side=tk.LEFT, padx=2)
-
-                # Status bar
-                status_frame = ttk.Frame(main_frame)
-                status_frame.pack(fill=tk.X, padx=5, pady=2)
-
-                file_info = f"{filesystem_path} | {img_width}×{img_height} | {os.path.getsize(filesystem_path) // 1024} KB"
-                status_label = ttk.Label(status_frame, text=file_info)
-                status_label.pack(side=tk.LEFT)
-
-                # Navigation info
-                nav_label = ttk.Label(status_frame, text="Mouse wheel: Zoom | Drag: Pan | Double-click: Fit")
-                nav_label.pack(side=tk.RIGHT)
-
-                # Bind events
-                canvas.bind("<Configure>", lambda e: self.on_canvas_configure(top))
-                canvas.bind("<MouseWheel>", lambda e: self.on_mouse_wheel(top, e))
-                canvas.bind("<ButtonPress-1>", lambda e: self.on_pan_start(top, e))
-                canvas.bind("<B1-Motion>", lambda e: self.on_pan_move(top, e))
-                canvas.bind("<Double-Button-1>", lambda e: self.fit_to_window(top))
-
-                # Keyboard shortcuts
-                top.bind("<plus>", lambda e: self.zoom_image(top, 1.25))
-                top.bind("<minus>", lambda e: self.zoom_image(top, 0.8))
-                top.bind("<Key-0>", lambda e: self.actual_size(top))
-                top.bind("<Key-f>", lambda e: self.fit_to_window(top))
-                top.bind("<Escape>", lambda e: top.destroy())
-
-                # Initial display
-                self.fit_to_window(top)
-
-                self.status_var.set(f"Opened: {os.path.basename(filesystem_path)}")
-
-            except Exception as e:
-                self.status_var.set(f"Error opening image: {str(e)}")
-                # Fallback to preview from database
-                if preview_data:
-                    self.show_full_image_from_preview(filename, preview_data, exif, rel_filename)
-                else:
-                    messagebox.showerror("Error", f"Cannot open image:\n{str(e)}")
-
-        except Exception as e:
-            self.status_var.set(f"Error: {str(e)}")
-
-    def on_canvas_configure(self, window):
-        """Handle canvas resize"""
-        if hasattr(window, '_canvas') and window._canvas:
-            # Update scroll region
-            window._canvas.configure(scrollregion=window._canvas.bbox("all"))
-            # If image is smaller than canvas, center it
-            self.center_image(window)
-
-    def zoom_image(self, window, factor):
-        """Zoom in/out on the image"""
-        if not hasattr(window, '_image') or not window._image:
-            return
-
-        # Calculate new zoom level
-        new_zoom = window._zoom_level * factor
-        if new_zoom < 0.1:  # Minimum zoom
-            new_zoom = 0.1
-        elif new_zoom > 10.0:  # Maximum zoom
-            new_zoom = 10.0
-
-        # Get current canvas dimensions
-        canvas_width = window._canvas.winfo_width()
-        canvas_height = window._canvas.winfo_height()
-
-        # Get mouse position relative to canvas
-        x = window._canvas.winfo_pointerx() - window._canvas.winfo_rootx()
-        y = window._canvas.winfo_pointery() - window._canvas.winfo_rooty()
-
-        # Calculate center point for zoom
-        center_x = x if 0 <= x <= canvas_width else canvas_width // 2
-        center_y = y if 0 <= y <= canvas_height else canvas_height // 2
-
-        # Resize image
-        img_width, img_height = window._image.size
-        new_width = int(img_width * new_zoom)
-        new_height = int(img_height * new_zoom)
-
-        resized_image = window._image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        window._current_image = resized_image
-        window._zoom_level = new_zoom
-
-        # Update display
-        self.update_image_display(window)
-
-        # Update zoom label
-        if hasattr(window, '_zoom_label'):
-            window._zoom_label.set(f"{int(new_zoom * 100)}%")
-
-        # Adjust pan to keep mouse position centered
-        if factor != 1.0:
-            # Calculate new pan position
-            scale_change = new_zoom / (window._zoom_level / factor)  # Actual factor applied
-            window._pan_x = center_x - (center_x - window._pan_x) * scale_change
-            window._pan_y = center_y - (center_y - window._pan_y) * scale_change
-
-            # Update canvas scroll
-            window._canvas.xview_moveto(window._pan_x / max(new_width, 1))
-            window._canvas.yview_moveto(window._pan_y / max(new_height, 1))
-
-    def fit_to_window(self, window):
-        """Fit image to window size"""
-        if not hasattr(window, '_image') or not window._image:
-            return
-
-        # Get canvas dimensions
-        canvas_width = window._canvas.winfo_width()
-        canvas_height = window._canvas.winfo_height()
-
-        if canvas_width <= 1 or canvas_height <= 1:
-            return
-
-        # Get image dimensions
-        img_width, img_height = window._image.size
-
-        # Calculate zoom to fit
-        zoom_width = canvas_width / img_width
-        zoom_height = canvas_height / img_height
-        new_zoom = min(zoom_width, zoom_height) * 0.95  # 95% to add some margin
-
-        # Apply zoom
-        window._zoom_level = new_zoom
-        new_width = int(img_width * new_zoom)
-        new_height = int(img_height * new_zoom)
-
-        resized_image = window._image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        window._current_image = resized_image
-
-        # Update display
-        self.update_image_display(window)
-
-        # Center image
-        self.center_image(window)
-
-        # Update zoom label
-        if hasattr(window, '_zoom_label'):
-            window._zoom_label.set(f"{int(new_zoom * 100)}%")
-
-    def actual_size(self, window):
-        """Show image at 100% zoom"""
-        if not hasattr(window, '_image') or not window._image:
-            return
-
-        window._zoom_level = 1.0
-        window._current_image = window._image
-
-        # Update display
-        self.update_image_display(window)
-
-        # Center image
-        self.center_image(window)
-
-        # Update zoom label
-        if hasattr(window, '_zoom_label'):
-            window._zoom_label.set("100%")
-
-    def update_image_display(self, window):
-        """Update the displayed image on canvas"""
-        if not hasattr(window, '_current_image') or not window._current_image:
-            return
-
-        # Clear canvas
-        window._canvas.delete("all")
-
-        # Convert PIL image to PhotoImage
-        photo = ImageTk.PhotoImage(window._current_image)
-
-        # Store reference to prevent garbage collection
-        window._photo = photo
-
-        # Display image
-        window._canvas.create_image(0, 0, anchor=tk.NW, image=photo, tags="image")
-
-        # Update scroll region
-        window._canvas.configure(scrollregion=window._canvas.bbox("all"))
-
-    def center_image(self, window):
-        """Center the image on canvas"""
-        if not hasattr(window, '_current_image') or not window._current_image:
-            return
-
-        # Get dimensions
-        img_width, img_height = window._current_image.size
-        canvas_width = window._canvas.winfo_width()
-        canvas_height = window._canvas.winfo_height()
-
-        if canvas_width <= 1 or canvas_height <= 1:
-            return
-
-        # Calculate center position
-        if img_width < canvas_width:
-            window._pan_x = (canvas_width - img_width) // 2
-        else:
-            window._pan_x = 0
-
-        if img_height < canvas_height:
-            window._pan_y = (canvas_height - img_height) // 2
-        else:
-            window._pan_y = 0
-
-        # Update canvas scroll
-        window._canvas.xview_moveto(window._pan_x / max(img_width, 1))
-        window._canvas.yview_moveto(window._pan_y / max(img_height, 1))
-
-    def on_mouse_wheel(self, window, event):
-        """Handle mouse wheel for zooming"""
-        if event.delta > 0:
-            self.zoom_image(window, 1.25)
-        else:
-            self.zoom_image(window, 0.8)
-
-    def on_pan_start(self, window, event):
-        """Start panning"""
-        window._pan_start_x = event.x
-        window._pan_start_y = event.y
-        window._canvas.scan_mark(event.x, event.y)
-
-    def on_pan_move(self, window, event):
-        """Move during panning"""
-        window._canvas.scan_dragto(event.x, event.y, gain=1)
-
-        # Update pan position
-        img_width, img_height = window._current_image.size
-        window._pan_x = int(window._canvas.canvasx(0))
-        window._pan_y = int(window._canvas.canvasy(0))
-
-    def show_full_image_from_preview(self, filename, preview_data, exif, rel_filename):
-        """Fallback: show image from database preview with auto-resizing"""
-        try:
-            image = Image.open(io.BytesIO(preview_data))
-
-            # Apply EXIF orientation if available
-            if exif:
-                image = self.apply_exif_orientation(image, exif)
-
-            top = tk.Toplevel(self.root)
-            top.title(f"Full Size (from DB) - {os.path.basename(filename)}")
-
-            # Get screen dimensions
-            screen_width = top.winfo_screenwidth()
-            screen_height = top.winfo_screenheight()
-
-            # Calculate initial window size
-            img_width, img_height = image.size
-            max_width = int(screen_width * 0.8)
-            max_height = int(screen_height * 0.8)
-
-            if img_width > max_width or img_height > max_height:
-                ratio = min(max_width / img_width, max_height / img_height)
-                initial_width = int(img_width * ratio)
-                initial_height = int(img_height * ratio)
-                top.geometry(
-                    f"{initial_width}x{initial_height}+{int((screen_width - initial_width) / 2)}+{int((screen_height - initial_height) / 2)}")
-            else:
-                top.geometry(
-                    f"{img_width}x{img_height + 100}+{int((screen_width - img_width) / 2)}+{int((screen_height - img_height) / 2)}")
-
-            # Store references
-            top._image = image
-            top._current_image = image
-            top._zoom_level = 1.0
-
-            # Create main frame
-            main_frame = ttk.Frame(top)
-            main_frame.pack(fill=tk.BOTH, expand=True)
-
-            # Create canvas with scrollbars
-            canvas_frame = ttk.Frame(main_frame)
-            canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-            canvas = tk.Canvas(canvas_frame, bg='gray20', highlightthickness=0)
-            v_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
-            h_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=canvas.xview)
-
-            canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
-
-            canvas.grid(row=0, column=0, sticky='nsew')
-            v_scrollbar.grid(row=0, column=1, sticky='ns')
-            h_scrollbar.grid(row=1, column=0, sticky='ew')
-
-            canvas_frame.grid_rowconfigure(0, weight=1)
-            canvas_frame.grid_columnconfigure(0, weight=1)
-
-            top._canvas = canvas
-            top._photo = None
-
-            # Control panel
-            control_frame = ttk.Frame(main_frame)
-            control_frame.pack(fill=tk.X, padx=5, pady=2)
-
-            # Zoom controls
-            zoom_frame = ttk.Frame(control_frame)
-            zoom_frame.pack(side=tk.LEFT, padx=5)
-
-            ttk.Button(zoom_frame, text="−", width=3,
-                       command=lambda: self.zoom_image(top, 0.8)).pack(side=tk.LEFT, padx=2)
-            ttk.Button(zoom_frame, text="Fit", width=4,
-                       command=lambda: self.fit_to_window(top)).pack(side=tk.LEFT, padx=2)
-            ttk.Button(zoom_frame, text="1:1", width=4,
-                       command=lambda: self.actual_size(top)).pack(side=tk.LEFT, padx=2)
-            ttk.Button(zoom_frame, text="+", width=3,
-                       command=lambda: self.zoom_image(top, 1.25)).pack(side=tk.LEFT, padx=2)
-
-            # Zoom label
-            self.zoom_label_var = tk.StringVar(value="100%")
-            zoom_label = ttk.Label(zoom_frame, textvariable=self.zoom_label_var, width=6)
-            zoom_label.pack(side=tk.LEFT, padx=5)
-            top._zoom_label = self.zoom_label_var
-
-            # Close button
-            ttk.Button(control_frame, text="Close",
-                       command=top.destroy).pack(side=tk.RIGHT, padx=5)
-
-            # Warning frame
-            warning_frame = ttk.Frame(main_frame)
-            warning_frame.pack(fill=tk.X, padx=5, pady=2)
-
-            warning_label = ttk.Label(warning_frame,
-                                      text=f"⚠ Showing preview from database. Original file not found: {rel_filename}",
-                                      foreground="orange")
-            warning_label.pack()
-
-            # Bind events
-            canvas.bind("<Configure>", lambda e: self.on_canvas_configure(top))
-            canvas.bind("<MouseWheel>", lambda e: self.on_mouse_wheel(top, e))
-            canvas.bind("<Double-Button-1>", lambda e: self.fit_to_window(top))
-
-            # Keyboard shortcuts
-            top.bind("<plus>", lambda e: self.zoom_image(top, 1.25))
-            top.bind("<minus>", lambda e: self.zoom_image(top, 0.8))
-            top.bind("<Key-0>", lambda e: self.actual_size(top))
-            top.bind("<Key-f>", lambda e: self.fit_to_window(top))
-            top.bind("<Escape>", lambda e: top.destroy())
-
-            # Initial display
-            self.fit_to_window(top)
-
-            self.status_var.set(f"Opened preview from database: {os.path.basename(filename)}")
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Cannot open image preview:\n{str(e)}")
-
-    def open_in_default_viewer(self, filepath):
-        """Open image in default system viewer"""
-        try:
-            if os.name == 'nt':
-                os.startfile(filepath)
-            else:
-                # For Linux/Mac
-                import subprocess
-                subprocess.Popen(['xdg-open', filepath])
-            self.status_var.set(f"Opened in default viewer: {os.path.basename(filepath)}")
-        except Exception as e:
-            self.status_var.set(f"Error opening in viewer: {str(e)}")
-
-    def open_explorer_for_file(self, filepath):
-        """Open file in explorer (alternative to open_explorer)"""
-        try:
-            if os.name == 'nt':
-                import subprocess
-                subprocess.Popen(f'explorer /select,"{filepath}"')
-                self.status_var.set(f"Opened explorer: {filepath}")
-            else:
-                # For Linux
-                import subprocess
-                file_dir = os.path.dirname(filepath)
-                subprocess.Popen(['xdg-open', file_dir])
-                self.status_var.set(f"Opened folder: {file_dir}")
-        except Exception as e:
-            self.status_var.set(f"Error opening explorer: {str(e)}")
-
-    def apply_exif_orientation(self, image, exif_json):
-        """Apply EXIF orientation to correctly rotate the image"""
-        if not exif_json or image is None:
-            return image
-
-        try:
-            # Parse EXIF data
-            if isinstance(exif_json, str):
-                try:
-                    exif_dict = json.loads(exif_json)
-                except json.JSONDecodeError:
-                    # Try to fix common JSON issues
-                    cleaned = exif_json.strip()
-                    if cleaned.startswith('"') and cleaned.endswith('"'):
-                        cleaned = cleaned[1:-1]
-                    try:
-                        exif_dict = json.loads(cleaned)
-                    except:
-                        # Try literal eval as last resort
-                        import ast
-                        try:
-                            exif_dict = ast.literal_eval(exif_json)
-                        except:
-                            # If all parsing fails, try to extract orientation manually
-                            import re
-                            match = re.search(r'"Orientation"\s*:\s*(\d+)', exif_json)
-                            if match:
-                                exif_dict = {'Orientation': int(match.group(1))}
-                            else:
-                                return image
-                except Exception as e:
-                    print(f"Error parsing EXIF string: {e}")
-                    return image
-            else:
-                exif_dict = exif_json
-
-            # Common orientation keys
-            orientation_keys = ['Image Orientation']
-
-            orientation = None
-
-            # First try direct keys
-            for key in orientation_keys:
-                if key in exif_dict:
-                    orientation = exif_dict[key]
-                    break
-
-            if orientation:
-                if orientation == 'Rotated 90 CW':
-                    return image.rotate(-90, expand=True)
-                if orientation == 'Rotated 90 CCW':
-                    return image.rotate(90, expand=True)
-                if orientation == 'Horizontal (normal)':
-                    return image
-                print(f"Unknown orientation value: {orientation}")
-                return image
-
-        except Exception as e:
-            print(f"Error applying EXIF orientation: {e}")
-            import traceback
-            traceback.print_exc()
-            return image
-
-        return image
-
-    def parse_exif_data(self, exif_json):
-        if not exif_json:
-            return []
-
-        try:
-            exif_data = []
-
-            if isinstance(exif_json, str):
-                try:
-                    exif_dict = json.loads(exif_json)
-                except:
-                    # Try to clean and parse
-                    cleaned = exif_json.strip()
-                    if cleaned.startswith('"') and cleaned.endswith('"'):
-                        cleaned = cleaned[1:-1]
-                    try:
-                        exif_dict = json.loads(cleaned)
-                    except:
-                        # Try to extract rotation/angle information
-                        import re
-
-                        # Check for rotation/angle patterns
-                        rotation_patterns = [
-                            (r'"rotation"\s*:\s*"?(\d+)"?', 'Поворот'),
-                            (r'"angle"\s*:\s*"?(\d+)"?', 'Угол'),
-                            (r'"rotate"\s*:\s*"?(\d+)"?', 'Вращение'),
-                            (r'rotation[=:]\s*"?(\d+)"?', 'Поворот'),
-                            (r'angle[=:]\s*"?(\d+)"?', 'Угол'),
-                            (r'rotate[=:]\s*"?(\d+)"?', 'Вращение'),
-                            (r'"Orientation"\s*:\s*"?(\d+)"?', 'Ориентация (EXIF)'),
-                            (r'"orientation"\s*:\s*"?(\d+)"?', 'Ориентация'),
-                        ]
-
-                        for pattern, display_name in rotation_patterns:
-                            match = re.search(pattern, exif_json, re.IGNORECASE)
-                            if match:
-                                value = match.group(1)
-                                exif_data.append((display_name, f"{value}°"))
-
-                        return exif_data
-            else:
-                exif_dict = exif_json
-
-            common_keys = {
-                'Make': 'Производитель',
-                'Model': 'Модель',
-                'DateTime': 'Дата и время',
-                'ExposureTime': 'Выдержка',
-                'FNumber': 'Диафрагма',
-                'ISOSpeedRatings': 'ISO',
-                'FocalLength': 'Фокусное расстояние',
-                'LensModel': 'Объектив',
-                'GPSLatitude': 'Широта',
-                'GPSLongitude': 'Долгота',
-                'ImageWidth': 'Ширина',
-                'ImageHeight': 'Высота',
-                'Orientation': 'Ориентация',
-                'Software': 'Программное обеспечение',
-                'Rotation': 'Поворот',
-                'rotation': 'Поворот',
-                'angle': 'Угол',
-                'Angle': 'Угол'
-            }
-
-            for key, display_name in common_keys.items():
-                if key in exif_dict:
-                    value = exif_dict[key]
-                    if key == 'ExposureTime' and isinstance(value, list):
-                        value = f"1/{int(1 / value[0])}" if value[0] < 1 else str(value[0])
-                    elif key == 'FNumber' and isinstance(value, list):
-                        value = f"f/{value[0]}"
-                    elif key == 'FocalLength' and isinstance(value, list):
-                        value = f"{value[0]} mm"
-                    elif key == 'DateTime':
-                        try:
-                            dt = datetime.strptime(value, '%Y:%m:%d %H:%M:%S')
-                            value = dt.strftime('%d.%m.%Y %H:%M:%S')
-                        except:
-                            pass
-                    elif key in ['Orientation', 'orientation', 'Rotation', 'rotation', 'Angle', 'angle']:
-                        # Add degree symbol for rotation values
-                        try:
-                            orientation_value = int(value)
-                            if orientation_value >= 0 and orientation_value <= 360:
-                                value = f"{value}°"
-                            else:
-                                # For standard EXIF codes, add description
-                                orientation_names = {
-                                    1: "Normal (0°)",
-                                    2: "Flipped horizontally",
-                                    3: "Rotated 180°",
-                                    4: "Flipped vertically",
-                                    5: "Transposed (90° CW + flip)",
-                                    6: "Rotated 90° CW",
-                                    7: "Transverse (90° CCW + flip)",
-                                    8: "Rotated 90° CCW"
-                                }
-                                if orientation_value in orientation_names:
-                                    value = f"{value} ({orientation_names[orientation_value]})"
-                        except:
-                            pass
-
-                    exif_data.append((display_name, str(value)))
-
-            for key, value in exif_dict.items():
-                if key not in common_keys and value not in (None, '', []):
-                    display_key = key.replace('_', ' ').title()
-                    exif_data.append((display_key, str(value)))
-
-            return exif_data
-
-        except Exception as e:
-            print(f"Error parsing EXIF: {e}")
-            return [("Ошибка парсинга", str(e))]
+    # Убраны методы on_double_click и show_full_image
