@@ -102,14 +102,17 @@ class MediaBrowser:
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        self.paned_window = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
-        self.paned_window.pack(fill=tk.BOTH, expand=True)
+        self.main_paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
+        self.main_paned.pack(fill=tk.BOTH, expand=True)
 
-        left_frame = ttk.Frame(self.paned_window)
-        self.paned_window.add(left_frame, weight=1)
+        left_panel = ttk.Frame(self.main_paned)
+        self.main_paned.add(left_panel, weight=2)  # Увеличенный вес для большей ширины
 
-        tree_frame = ttk.Frame(left_frame)
-        tree_frame.pack(fill=tk.BOTH, expand=True)
+        tree_container = ttk.LabelFrame(left_panel, text="File Browser")
+        tree_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        tree_frame = ttk.Frame(tree_container)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         self.tree = ttk.Treeview(tree_frame, columns=('Filename',), show='tree headings')
 
@@ -117,7 +120,7 @@ class MediaBrowser:
         self.tree.column('#0', width=50, minwidth=50, stretch=False)
 
         self.tree.heading('Filename', text='Filename')
-        self.tree.column('Filename', width=200, minwidth=150, stretch=True)
+        self.tree.column('Filename', width=300, minwidth=200, stretch=True)  # Увеличена ширина
 
         self.v_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.h_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
@@ -130,17 +133,17 @@ class MediaBrowser:
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
 
-        right_frame = ttk.Frame(self.paned_window)
-        self.paned_window.add(right_frame, weight=3)
+        # ===== ЦЕНТРАЛЬНАЯ ПАНЕЛЬ (превью) - СДЕЛАНО УЖЕ =====
+        center_panel = ttk.Frame(self.main_paned)
+        self.main_paned.add(center_panel, weight=1)  # Уменьшенный вес для меньшей ширины
 
-        preview_exif_frame = ttk.Frame(right_frame)
-        preview_exif_frame.pack(fill=tk.BOTH, expand=True)
+        # Вертикальный PanedWindow внутри центральной панели для превью и caption
+        center_vertical = ttk.PanedWindow(center_panel, orient=tk.VERTICAL)
+        center_vertical.pack(fill=tk.BOTH, expand=True)
 
-        preview_left_frame = ttk.Frame(preview_exif_frame)
-        preview_left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        preview_container = ttk.LabelFrame(preview_left_frame, text="Image Preview")
-        preview_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Верхняя часть - превью изображения
+        preview_container = ttk.LabelFrame(center_vertical, text="Image Preview")
+        center_vertical.add(preview_container, weight=3)
 
         self.preview_canvas = tk.Canvas(preview_container, background='white')
         self.preview_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -149,33 +152,38 @@ class MediaBrowser:
         self.current_image_data = None
         self.current_pil_image = None
 
-        caption_container = ttk.LabelFrame(preview_left_frame, text="Caption")
-        caption_container.pack(fill=tk.X, padx=5, pady=5)
+        # Нижняя часть - caption
+        caption_container = ttk.LabelFrame(center_vertical, text="Caption")
+        center_vertical.add(caption_container, weight=1)
 
         self.caption_text = scrolledtext.ScrolledText(caption_container, height=6, wrap=tk.WORD)
         self.caption_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        exif_frame = ttk.LabelFrame(preview_exif_frame, text="EXIF Information")
-        exif_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False, padx=5, pady=5)
-        exif_frame.config(width=400)
+        # ===== ПРАВАЯ ПАНЕЛЬ (EXIF) - СДЕЛАНО ШИРЕ =====
+        right_panel = ttk.Frame(self.main_paned)
+        self.main_paned.add(right_panel, weight=2)  # Увеличенный вес для большей ширины
 
-        self.exif_tree = ttk.Treeview(exif_frame, columns=('Property', 'Value'), show='tree headings')
+        exif_container = ttk.LabelFrame(right_panel, text="EXIF Information")
+        exif_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.exif_tree = ttk.Treeview(exif_container, columns=('Property', 'Value'), show='tree headings')
         self.exif_tree.column('#0', width=0, stretch=False)
         self.exif_tree.heading('Property', text='Property')
         self.exif_tree.heading('Value', text='Value')
-        self.exif_tree.column('Property', width=150, minwidth=120)
-        self.exif_tree.column('Value', width=250, minwidth=200)
+        self.exif_tree.column('Property', width=200, minwidth=150)  # Увеличены ширины
+        self.exif_tree.column('Value', width=350, minwidth=250)
 
-        exif_scrollbar = ttk.Scrollbar(exif_frame, orient=tk.VERTICAL, command=self.exif_tree.yview)
+        exif_scrollbar = ttk.Scrollbar(exif_container, orient=tk.VERTICAL, command=self.exif_tree.yview)
         self.exif_tree.configure(yscrollcommand=exif_scrollbar.set)
 
         self.exif_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         exif_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.paned_window.sashpos(0, 400)
+        self.main_paned.sashpos(0, 500)
+        self.main_paned.sashpos(1, 800)
+        center_vertical.sashpos(0, 400)
 
         self.tree.bind('<<TreeviewSelect>>', self.on_select)
-        # Убрана привязка двойного клика
 
     def on_filter_changed(self):
         self.hide_no_preview = self.hide_no_preview_var.get()
@@ -429,12 +437,10 @@ class MediaBrowser:
             else:
                 exif_dict = exif_json
 
-            # Common orientation keys
             orientation_keys = ['Image Orientation']
 
             orientation = None
 
-            # First try direct keys
             for key in orientation_keys:
                 if key in exif_dict:
                     orientation = exif_dict[key]
@@ -667,5 +673,3 @@ class MediaBrowser:
         self.preview_canvas.create_image(x, y, anchor=tk.NW, image=photo)
 
         self.preview_canvas.image = photo
-
-    # Убраны методы on_double_click и show_full_image
