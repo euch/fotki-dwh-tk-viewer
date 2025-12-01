@@ -1,16 +1,19 @@
-import tkinter as tk
-from tkinter import ttk, scrolledtext, Menu, messagebox
-from PIL import Image, ImageTk, ImageOps
 import io
-import threading
+import json
 import os
 import subprocess
-import json
+import threading
+import tkinter as tk
 from datetime import datetime
+from tkinter import ttk, scrolledtext, Menu, messagebox
+
 import psycopg2
+from PIL import Image, ImageTk, ImageOps
 from psycopg2 import OperationalError
+
 from config import Config
 from config_dialog import ConfigDialog
+
 
 class MediaBrowser:
     def __init__(self, root):
@@ -27,7 +30,7 @@ class MediaBrowser:
         self.is_loading = False
         self.has_more_data = True
         self.current_search = ""
-        self.hide_no_preview = False
+        self.hide_no_preview = True
         self.thumbnail_cache = {}
         self.thumbnail_photos = {}
 
@@ -253,7 +256,6 @@ class MediaBrowser:
         self.load_images(initial_load=True)
         self.status_var.set("Data reloaded")
 
-
     def try_connect(self):
         if self.connect_db():
             self.load_images(initial_load=True)
@@ -328,6 +330,101 @@ class MediaBrowser:
         view_menu.add_command(label="Reload", command=self.reload_data)
         view_menu.add_command(label="Clear Cache", command=self.clear_cache)
 
+        # Debug menu
+        debug_menu = Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Debug", menu=debug_menu)
+        debug_menu.add_command(label="Check EXIF", command=self.debug_exif)
+
+    def debug_exif(self):
+        """Debug function to check EXIF data"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("Debug", "No image selected")
+            return
+
+        abs_filename = selection[0]
+
+        try:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT exif, preview 
+                FROM dm.images_collection 
+                WHERE abs_filename = %s
+            """, (abs_filename,))
+            result = cur.fetchone()
+            cur.close()
+
+            if result:
+                exif, preview = result
+                debug_win = tk.Toplevel(self.root)
+                debug_win.title(f"EXIF Debug - {abs_filename.split('/')[-1]}")
+                debug_win.geometry("800x600")
+
+                text = scrolledtext.ScrolledText(debug_win, wrap=tk.WORD)
+                text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+                debug_info = []
+                debug_info.append(f"File: {abs_filename}")
+                debug_info.append(f"Preview exists: {preview is not None}")
+                debug_info.append("")
+                debug_info.append("EXIF data:")
+                debug_info.append("=" * 80)
+
+                if exif:
+                    if isinstance(exif, str):
+                        debug_info.append(f"Type: string")
+                        debug_info.append(f"Length: {len(exif)} characters")
+                        debug_info.append("")
+                        debug_info.append("Raw content:")
+                        debug_info.append("-" * 40)
+                        debug_info.append(exif)
+                        debug_info.append("")
+                        debug_info.append("-" * 40)
+
+                        # Try to parse
+                        try:
+                            parsed = json.loads(exif)
+                            debug_info.append("\nParsed as JSON:")
+                            debug_info.append(json.dumps(parsed, indent=2))
+                        except json.JSONDecodeError as je:
+                            debug_info.append(f"\nJSON parse error: {je}")
+
+                            # Show first 500 chars for analysis
+                            debug_info.append("\nFirst 500 characters:")
+                            debug_info.append(exif[:500])
+
+                            # Look for rotation patterns
+                            import re
+                            debug_info.append("\n\nSearching for rotation patterns:")
+                            patterns = [
+                                ('Orientation', r'Orientation[":\s]+(\d+)'),
+                                ('orientation', r'orientation[":\s]+(\d+)'),
+                                ('Rotation', r'Rotation[":\s]+(\d+)'),
+                                ('rotation', r'rotation[":\s]+(\d+)'),
+                                ('Angle', r'Angle[":\s]+(\d+)'),
+                                ('angle', r'angle[":\s]+(\d+)'),
+                                ('Rotate', r'Rotate[":\s]+(\d+)'),
+                                ('rotate', r'rotate[":\s]+(\d+)'),
+                            ]
+
+                            for name, pattern in patterns:
+                                matches = re.findall(pattern, exif, re.IGNORECASE)
+                                if matches:
+                                    debug_info.append(f"  {name}: {', '.join(matches)}")
+                    else:
+                        debug_info.append(f"Type: {type(exif)}")
+                        debug_info.append(json.dumps(exif, indent=2))
+                else:
+                    debug_info.append("No EXIF data")
+
+                text.insert(1.0, "\n".join(debug_info))
+                text.config(state=tk.DISABLED)
+            else:
+                messagebox.showinfo("Debug", "No data found")
+
+        except Exception as e:
+            messagebox.showerror("Debug Error", f"Error: {str(e)}")
+
     def reconnect_db(self):
         if self.connect_db():
             self.reload_data()
@@ -377,16 +474,6 @@ class MediaBrowser:
         else:
             self.status_var.set(f"Path not found: {win_path}")
 
-
-    def reload_data(self):
-        self.current_offset = 0
-        self.has_more_data = True
-        self.thumbnail_cache.clear()
-        self.thumbnail_photos.clear()
-        self.tree.delete(*self.tree.get_children())
-        self.load_images(initial_load=True)
-        self.status_var.set("Data reloaded")
-
     def clear_cache(self):
         self.thumbnail_cache.clear()
         self.thumbnail_photos.clear()
@@ -398,63 +485,9 @@ class MediaBrowser:
         if float(args[1]) > 0.9 and not self.is_loading and self.has_more_data:
             self.load_more_data()
 
-    def apply_exif_orientation(self, image, exif_json):
-        if not exif_json:
-            return image
-
-        try:
-            if isinstance(exif_json, str):
-                exif_dict = json.loads(exif_json)
-            else:
-                exif_dict = exif_json
-
-            # Check for orientation in EXIF data
-            orientation = exif_dict.get('Orientation')
-
-            if orientation:
-                # EXIF orientation values and corresponding transformations:
-                # 1: Normal (no rotation)
-                # 2: Flipped horizontally
-                # 3: Rotated 180 degrees
-                # 4: Flipped vertically
-                # 5: Transposed (rotated 90 CW and flipped horizontally)
-                # 6: Rotated 90 CW
-                # 7: Transverse (rotated 90 CCW and flipped horizontally)
-                # 8: Rotated 90 CCW
-
-                if orientation == 2:
-                    # Flip horizontally
-                    image = ImageOps.mirror(image)
-                elif orientation == 3:
-                    # Rotate 180 degrees
-                    image = image.rotate(180, expand=True)
-                elif orientation == 4:
-                    # Flip vertically
-                    image = ImageOps.flip(image)
-                elif orientation == 5:
-                    # Rotate 90 CW and flip horizontally
-                    image = image.rotate(-90, expand=True)
-                    image = ImageOps.mirror(image)
-                elif orientation == 6:
-                    # Rotate 90 CW
-                    image = image.rotate(-90, expand=True)
-                elif orientation == 7:
-                    # Rotate 90 CCW and flip horizontally
-                    image = image.rotate(90, expand=True)
-                    image = ImageOps.mirror(image)
-                elif orientation == 8:
-                    # Rotate 90 CCW
-                    image = image.rotate(90, expand=True)
-
-        except Exception as e:
-            print(f"Error applying EXIF orientation: {e}")
-
-        return image
-
     def create_thumbnail(self, preview_data, size=(30, 30), exif_json=None):
         """Создает миниатюру изображения с учетом EXIF ориентации"""
         if not preview_data:
-            # Return None or create a placeholder
             return None
 
         try:
@@ -488,49 +521,6 @@ class MediaBrowser:
         except Exception as e:
             print(f"Error creating thumbnail: {e}")
             return None
-
-    def load_images(self, initial_load=False):
-        if self.is_loading:
-            return
-
-        self.is_loading = True
-        self.status_var.set("Loading...")
-
-        def load_in_thread():
-            try:
-                cur = self.conn.cursor()
-                offset = 0 if initial_load else self.current_offset
-
-                if self.current_search:
-                    query = """
-                        SELECT abs_filename, rel_filename, preview, latest_caption, exif 
-                        FROM dm.images_collection
-                        WHERE latest_caption ILIKE %s OR exif::text ILIKE %s OR rel_filename ILIKE %s
-                        ORDER BY rel_filename desc
-                        LIMIT %s OFFSET %s
-                        """
-                    cur.execute(query, (f'%{self.current_search}%', f'%{self.current_search}%', f'%{self.current_search}%', self.batch_size, offset))
-                else:
-                    query = """
-                        SELECT abs_filename, rel_filename, preview, latest_caption, exif 
-                        FROM dm.images_collection
-                        ORDER BY rel_filename desc
-                        LIMIT %s OFFSET %s
-                        """
-                    cur.execute(query, (self.batch_size, offset))
-
-                rows = cur.fetchall()
-                cur.close()
-
-                has_more = len(rows) == self.batch_size
-
-                self.root.after(0, self.update_treeview, rows, has_more, initial_load)
-
-            except Exception as e:
-                self.root.after(0, lambda: self.status_var.set(f"Error: {str(e)}"))
-                self.root.after(0, lambda: setattr(self, 'is_loading', False))
-
-        threading.Thread(target=load_in_thread, daemon=True).start()
 
     def load_more_data(self):
         if not self.is_loading and self.has_more_data:
@@ -590,80 +580,6 @@ class MediaBrowser:
             self.is_loading = False
             self.status_var.set(f"Error updating treeview: {str(e)}")
 
-    def parse_exif_data(self, exif_json):
-        if not exif_json:
-            return []
-
-        try:
-            exif_data = []
-
-            if isinstance(exif_json, str):
-                exif_dict = json.loads(exif_json)
-            else:
-                exif_dict = exif_json
-
-            common_keys = {
-                'Make': 'Производитель',
-                'Model': 'Модель',
-                'DateTime': 'Дата и время',
-                'ExposureTime': 'Выдержка',
-                'FNumber': 'Диафрагма',
-                'ISOSpeedRatings': 'ISO',
-                'FocalLength': 'Фокусное расстояние',
-                'LensModel': 'Объектив',
-                'GPSLatitude': 'Широта',
-                'GPSLongitude': 'Долгота',
-                'ImageWidth': 'Ширина',
-                'ImageHeight': 'Высота',
-                'Orientation': 'Ориентация',
-                'Software': 'Программное обеспечение'
-            }
-
-            for key, display_name in common_keys.items():
-                if key in exif_dict:
-                    value = exif_dict[key]
-                    if key == 'ExposureTime' and isinstance(value, list):
-                        value = f"1/{int(1/value[0])}" if value[0] < 1 else str(value[0])
-                    elif key == 'FNumber' and isinstance(value, list):
-                        value = f"f/{value[0]}"
-                    elif key == 'FocalLength' and isinstance(value, list):
-                        value = f"{value[0]} mm"
-                    elif key == 'DateTime':
-                        try:
-                            dt = datetime.strptime(value, '%Y:%m:%d %H:%M:%S')
-                            value = dt.strftime('%d.%m.%Y %H:%M:%S')
-                        except:
-                            pass
-                    elif key == 'Orientation':
-                        # Add human-readable orientation description
-                        orientation_names = {
-                            1: "Normal",
-                            2: "Flipped horizontally",
-                            3: "Rotated 180°",
-                            4: "Flipped vertically",
-                            5: "Transposed",
-                            6: "Rotated 90° CW",
-                            7: "Transverse",
-                            8: "Rotated 90° CCW"
-                        }
-                        orientation_value = str(value)
-                        if isinstance(value, (int, float)) and int(value) in orientation_names:
-                            orientation_value = f"{value} ({orientation_names[int(value)]})"
-                        value = orientation_value
-
-                    exif_data.append((display_name, str(value)))
-
-            for key, value in exif_dict.items():
-                if key not in common_keys and value not in (None, '', []):
-                    display_key = key.replace('_', ' ').title()
-                    exif_data.append((display_key, str(value)))
-
-            return exif_data
-
-        except Exception as e:
-            print(f"Error parsing EXIF: {e}")
-            return [("Ошибка парсинга", str(e))]
-
     def update_exif_panel(self, exif_json):
         for item in self.exif_tree.get_children():
             self.exif_tree.delete(item)
@@ -679,7 +595,7 @@ class MediaBrowser:
 
     def on_select(self, event):
         selection = self.tree.selection()
-        if not selection:
+        if not selection or not self.conn:
             self.show_in_folder_button.config(state="disabled")
             return
 
@@ -691,10 +607,10 @@ class MediaBrowser:
             try:
                 cur = self.conn.cursor()
                 cur.execute("""
-                        SELECT rel_filename, preview, latest_caption, exif 
-                        FROM dm.images_collection 
-                        WHERE abs_filename = %s
-                    """, (abs_filename,))
+                    SELECT rel_filename, preview, latest_caption, exif 
+                    FROM dm.images_collection 
+                    WHERE abs_filename = %s
+                """, (abs_filename,))
                 result = cur.fetchone()
                 cur.close()
 
@@ -772,39 +688,23 @@ class MediaBrowser:
 
         self.preview_canvas.image = photo
 
-    def open_file(self):
-        if hasattr(self, 'selected_rel_filename') and self.selected_rel_filename:
-            if os.name == 'nt':
-                self.open_explorer()
-            else:
-                self.status_var.set(f"Not implemented for {os.name}")
-        else:
-            self.status_var.set("No file available")
-
-    def open_explorer(self):
-        win_path = os.path.join(self.current_disk_label, self.selected_rel_filename).replace('/', '\\')
-        if os.path.exists(win_path):
-            try:
-                subprocess.Popen(f'explorer /select,"{win_path}"')
-                self.status_var.set(f"Opened explorer: {win_path}")
-            except Exception as e:
-                self.status_var.set(f"Error opening explorer: {str(e)}")
-        else:
-            self.status_var.set(f"Path not found: {win_path}")
-
     def on_double_click(self, event):
         selection = self.tree.selection()
         if selection:
             self.show_full_image(selection[0])
 
     def show_full_image(self, filename):
+        if not self.conn:
+            self.status_var.set("Not connected to database")
+            return
+
         try:
             cur = self.conn.cursor()
             cur.execute("""
-                    SELECT preview, exif 
-                    FROM dm.images_collection 
-                    WHERE abs_filename = %s
-                """, (filename,))
+                SELECT preview, exif 
+                FROM dm.images_collection 
+                WHERE abs_filename = %s
+            """, (filename,))
             result = cur.fetchone()
             cur.close()
 
@@ -835,6 +735,7 @@ class MediaBrowser:
 
                 photo = ImageTk.PhotoImage(image)
 
+                # Store reference to prevent garbage collection
                 top._photo = photo
 
                 canvas.create_image(0, 0, anchor=tk.NW, image=photo)
@@ -842,3 +743,183 @@ class MediaBrowser:
 
         except Exception as e:
             self.status_var.set(f"Error opening full image: {str(e)}")
+
+    def apply_exif_orientation(self, image, exif_json):
+        """Apply EXIF orientation to correctly rotate the image"""
+        if not exif_json or image is None:
+            return image
+
+        try:
+            # Parse EXIF data
+            if isinstance(exif_json, str):
+                try:
+                    exif_dict = json.loads(exif_json)
+                except json.JSONDecodeError:
+                    # Try to fix common JSON issues
+                    cleaned = exif_json.strip()
+                    if cleaned.startswith('"') and cleaned.endswith('"'):
+                        cleaned = cleaned[1:-1]
+                    try:
+                        exif_dict = json.loads(cleaned)
+                    except:
+                        # Try literal eval as last resort
+                        import ast
+                        try:
+                            exif_dict = ast.literal_eval(exif_json)
+                        except:
+                            # If all parsing fails, try to extract orientation manually
+                            import re
+                            match = re.search(r'"Orientation"\s*:\s*(\d+)', exif_json)
+                            if match:
+                                exif_dict = {'Orientation': int(match.group(1))}
+                            else:
+                                return image
+                except Exception as e:
+                    print(f"Error parsing EXIF string: {e}")
+                    return image
+            else:
+                exif_dict = exif_json
+
+            # Common orientation keys
+            orientation_keys = ['Image Orientation']
+
+            orientation = None
+
+            # First try direct keys
+            for key in orientation_keys:
+                if key in exif_dict:
+                    orientation = exif_dict[key]
+                    break
+
+            if orientation:
+                if orientation == 'Rotated 90 CW':
+                    return image.rotate(-90, expand=True)
+                if orientation == 'Rotated 90 CCW':
+                    return image.rotate(90, expand=True)
+                if orientation == 'Horizontal (normal)':
+                    return image
+                print(f"Unknown orientation value: {orientation}")
+                return image
+
+        except Exception as e:
+            print(f"Error applying EXIF orientation: {e}")
+            import traceback
+            traceback.print_exc()
+            return image
+
+        return image
+
+    def parse_exif_data(self, exif_json):
+        if not exif_json:
+            return []
+
+        try:
+            exif_data = []
+
+            if isinstance(exif_json, str):
+                try:
+                    exif_dict = json.loads(exif_json)
+                except:
+                    # Try to clean and parse
+                    cleaned = exif_json.strip()
+                    if cleaned.startswith('"') and cleaned.endswith('"'):
+                        cleaned = cleaned[1:-1]
+                    try:
+                        exif_dict = json.loads(cleaned)
+                    except:
+                        # Try to extract rotation/angle information
+                        import re
+
+                        # Check for rotation/angle patterns
+                        rotation_patterns = [
+                            (r'"rotation"\s*:\s*"?(\d+)"?', 'Поворот'),
+                            (r'"angle"\s*:\s*"?(\d+)"?', 'Угол'),
+                            (r'"rotate"\s*:\s*"?(\d+)"?', 'Вращение'),
+                            (r'rotation[=:]\s*"?(\d+)"?', 'Поворот'),
+                            (r'angle[=:]\s*"?(\d+)"?', 'Угол'),
+                            (r'rotate[=:]\s*"?(\d+)"?', 'Вращение'),
+                            (r'"Orientation"\s*:\s*"?(\d+)"?', 'Ориентация (EXIF)'),
+                            (r'"orientation"\s*:\s*"?(\d+)"?', 'Ориентация'),
+                        ]
+
+                        for pattern, display_name in rotation_patterns:
+                            match = re.search(pattern, exif_json, re.IGNORECASE)
+                            if match:
+                                value = match.group(1)
+                                exif_data.append((display_name, f"{value}°"))
+
+                        return exif_data
+            else:
+                exif_dict = exif_json
+
+            common_keys = {
+                'Make': 'Производитель',
+                'Model': 'Модель',
+                'DateTime': 'Дата и время',
+                'ExposureTime': 'Выдержка',
+                'FNumber': 'Диафрагма',
+                'ISOSpeedRatings': 'ISO',
+                'FocalLength': 'Фокусное расстояние',
+                'LensModel': 'Объектив',
+                'GPSLatitude': 'Широта',
+                'GPSLongitude': 'Долгота',
+                'ImageWidth': 'Ширина',
+                'ImageHeight': 'Высота',
+                'Orientation': 'Ориентация',
+                'Software': 'Программное обеспечение',
+                'Rotation': 'Поворот',
+                'rotation': 'Поворот',
+                'angle': 'Угол',
+                'Angle': 'Угол'
+            }
+
+            for key, display_name in common_keys.items():
+                if key in exif_dict:
+                    value = exif_dict[key]
+                    if key == 'ExposureTime' and isinstance(value, list):
+                        value = f"1/{int(1 / value[0])}" if value[0] < 1 else str(value[0])
+                    elif key == 'FNumber' and isinstance(value, list):
+                        value = f"f/{value[0]}"
+                    elif key == 'FocalLength' and isinstance(value, list):
+                        value = f"{value[0]} mm"
+                    elif key == 'DateTime':
+                        try:
+                            dt = datetime.strptime(value, '%Y:%m:%d %H:%M:%S')
+                            value = dt.strftime('%d.%m.%Y %H:%M:%S')
+                        except:
+                            pass
+                    elif key in ['Orientation', 'orientation', 'Rotation', 'rotation', 'Angle', 'angle']:
+                        # Add degree symbol for rotation values
+                        try:
+                            orientation_value = int(value)
+                            if orientation_value >= 0 and orientation_value <= 360:
+                                value = f"{value}°"
+                            else:
+                                # For standard EXIF codes, add description
+                                orientation_names = {
+                                    1: "Normal (0°)",
+                                    2: "Flipped horizontally",
+                                    3: "Rotated 180°",
+                                    4: "Flipped vertically",
+                                    5: "Transposed (90° CW + flip)",
+                                    6: "Rotated 90° CW",
+                                    7: "Transverse (90° CCW + flip)",
+                                    8: "Rotated 90° CCW"
+                                }
+                                if orientation_value in orientation_names:
+                                    value = f"{value} ({orientation_names[orientation_value]})"
+                        except:
+                            pass
+
+                    exif_data.append((display_name, str(value)))
+
+            for key, value in exif_dict.items():
+                if key not in common_keys and value not in (None, '', []):
+                    display_key = key.replace('_', ' ').title()
+                    exif_data.append((display_key, str(value)))
+
+            return exif_data
+
+        except Exception as e:
+            print(f"Error parsing EXIF: {e}")
+            return [("Ошибка парсинга", str(e))]
