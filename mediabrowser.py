@@ -1,14 +1,13 @@
 import io
 import json
 import os
-import subprocess
 import threading
 import tkinter as tk
 from datetime import datetime
 from tkinter import ttk, scrolledtext, Menu, messagebox
 
 import psycopg2
-from PIL import Image, ImageTk, ImageOps
+from PIL import Image, ImageTk
 from psycopg2 import OperationalError
 
 from config import Config
@@ -330,101 +329,6 @@ class MediaBrowser:
         view_menu.add_command(label="Reload", command=self.reload_data)
         view_menu.add_command(label="Clear Cache", command=self.clear_cache)
 
-        # Debug menu
-        debug_menu = Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Debug", menu=debug_menu)
-        debug_menu.add_command(label="Check EXIF", command=self.debug_exif)
-
-    def debug_exif(self):
-        """Debug function to check EXIF data"""
-        selection = self.tree.selection()
-        if not selection:
-            messagebox.showinfo("Debug", "No image selected")
-            return
-
-        abs_filename = selection[0]
-
-        try:
-            cur = self.conn.cursor()
-            cur.execute("""
-                SELECT exif, preview 
-                FROM dm.images_collection 
-                WHERE abs_filename = %s
-            """, (abs_filename,))
-            result = cur.fetchone()
-            cur.close()
-
-            if result:
-                exif, preview = result
-                debug_win = tk.Toplevel(self.root)
-                debug_win.title(f"EXIF Debug - {abs_filename.split('/')[-1]}")
-                debug_win.geometry("800x600")
-
-                text = scrolledtext.ScrolledText(debug_win, wrap=tk.WORD)
-                text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-                debug_info = []
-                debug_info.append(f"File: {abs_filename}")
-                debug_info.append(f"Preview exists: {preview is not None}")
-                debug_info.append("")
-                debug_info.append("EXIF data:")
-                debug_info.append("=" * 80)
-
-                if exif:
-                    if isinstance(exif, str):
-                        debug_info.append(f"Type: string")
-                        debug_info.append(f"Length: {len(exif)} characters")
-                        debug_info.append("")
-                        debug_info.append("Raw content:")
-                        debug_info.append("-" * 40)
-                        debug_info.append(exif)
-                        debug_info.append("")
-                        debug_info.append("-" * 40)
-
-                        # Try to parse
-                        try:
-                            parsed = json.loads(exif)
-                            debug_info.append("\nParsed as JSON:")
-                            debug_info.append(json.dumps(parsed, indent=2))
-                        except json.JSONDecodeError as je:
-                            debug_info.append(f"\nJSON parse error: {je}")
-
-                            # Show first 500 chars for analysis
-                            debug_info.append("\nFirst 500 characters:")
-                            debug_info.append(exif[:500])
-
-                            # Look for rotation patterns
-                            import re
-                            debug_info.append("\n\nSearching for rotation patterns:")
-                            patterns = [
-                                ('Orientation', r'Orientation[":\s]+(\d+)'),
-                                ('orientation', r'orientation[":\s]+(\d+)'),
-                                ('Rotation', r'Rotation[":\s]+(\d+)'),
-                                ('rotation', r'rotation[":\s]+(\d+)'),
-                                ('Angle', r'Angle[":\s]+(\d+)'),
-                                ('angle', r'angle[":\s]+(\d+)'),
-                                ('Rotate', r'Rotate[":\s]+(\d+)'),
-                                ('rotate', r'rotate[":\s]+(\d+)'),
-                            ]
-
-                            for name, pattern in patterns:
-                                matches = re.findall(pattern, exif, re.IGNORECASE)
-                                if matches:
-                                    debug_info.append(f"  {name}: {', '.join(matches)}")
-                    else:
-                        debug_info.append(f"Type: {type(exif)}")
-                        debug_info.append(json.dumps(exif, indent=2))
-                else:
-                    debug_info.append("No EXIF data")
-
-                text.insert(1.0, "\n".join(debug_info))
-                text.config(state=tk.DISABLED)
-            else:
-                messagebox.showinfo("Debug", "No data found")
-
-        except Exception as e:
-            messagebox.showerror("Debug Error", f"Error: {str(e)}")
-
     def reconnect_db(self):
         if self.connect_db():
             self.reload_data()
@@ -464,15 +368,11 @@ class MediaBrowser:
             self.status_var.set("No file available")
 
     def open_explorer(self):
-        win_path = os.path.join(self.current_disk_label, self.selected_rel_filename).replace('/', '\\')
-        if os.path.exists(win_path):
-            try:
-                subprocess.Popen(f'explorer /select,"{win_path}"')
-                self.status_var.set(f"Opened explorer: {win_path}")
-            except Exception as e:
-                self.status_var.set(f"Error opening explorer: {str(e)}")
+        if hasattr(self, 'selected_rel_filename') and self.selected_rel_filename:
+            win_path = os.path.join(self.current_disk_label, self.selected_rel_filename).replace('/', '\\')
+            self.open_explorer_for_file(win_path)
         else:
-            self.status_var.set(f"Path not found: {win_path}")
+            self.status_var.set("No file available")
 
     def clear_cache(self):
         self.thumbnail_cache.clear()
@@ -689,60 +589,524 @@ class MediaBrowser:
         self.preview_canvas.image = photo
 
     def on_double_click(self, event):
+        """Handle double click on tree item"""
         selection = self.tree.selection()
         if selection:
-            self.show_full_image(selection[0])
+            # Get the absolute filename from the tree item ID
+            abs_filename = selection[0]
+            self.show_full_image(abs_filename)
 
     def show_full_image(self, filename):
-        if not self.conn:
-            self.status_var.set("Not connected to database")
-            return
-
+        """Show full image from filesystem with auto-resizing"""
         try:
+            # First get the relative filename from database
             cur = self.conn.cursor()
             cur.execute("""
-                SELECT preview, exif 
+                SELECT rel_filename, preview, exif 
                 FROM dm.images_collection 
                 WHERE abs_filename = %s
             """, (filename,))
             result = cur.fetchone()
             cur.close()
 
-            if result and result[0]:
-                preview_data, exif = result
-                top = tk.Toplevel(self.root)
-                top.title(f"Full Size - {filename.split('/')[-1]}")
-                top.geometry("1000x800")
+            if not result:
+                self.status_var.set(f"Image not found in database: {filename}")
+                return
 
-                frame = ttk.Frame(top)
-                frame.pack(fill=tk.BOTH, expand=True)
+            rel_filename, preview_data, exif = result
 
-                canvas = tk.Canvas(frame)
-                v_scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=canvas.yview)
-                h_scrollbar = ttk.Scrollbar(frame, orient=tk.HORIZONTAL, command=canvas.xview)
+            # Build filesystem path
+            if hasattr(self, 'current_disk_label') and self.current_disk_label:
+                filesystem_path = os.path.join(self.current_disk_label, rel_filename).replace('/', '\\')
+            else:
+                filesystem_path = rel_filename
 
-                canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+            # Check if file exists
+            if not os.path.exists(filesystem_path):
+                self.status_var.set(f"File not found: {filesystem_path}")
 
-                v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-                h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
-                canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                # Fallback to preview from database if available
+                if preview_data:
+                    self.show_full_image_from_preview(filename, preview_data, exif, rel_filename)
+                else:
+                    messagebox.showerror("File Not Found",
+                                         f"Cannot find file:\n{filesystem_path}\n\n"
+                                         f"Check if disk {self.current_disk_label} is available.")
+                return
 
-                image = Image.open(io.BytesIO(preview_data))
+            # Open image from filesystem
+            try:
+                image = Image.open(filesystem_path)
 
-                # Apply EXIF orientation to full-size image
+                # Apply EXIF orientation if available
                 if exif:
                     image = self.apply_exif_orientation(image, exif)
 
-                photo = ImageTk.PhotoImage(image)
+                # Create window
+                top = tk.Toplevel(self.root)
+                top.title(f"Full Size - {os.path.basename(filesystem_path)}")
 
-                # Store reference to prevent garbage collection
-                top._photo = photo
+                # Get screen dimensions
+                screen_width = top.winfo_screenwidth()
+                screen_height = top.winfo_screenheight()
 
-                canvas.create_image(0, 0, anchor=tk.NW, image=photo)
-                canvas.configure(scrollregion=canvas.bbox("all"))
+                # Calculate initial window size (80% of screen, but not larger than image)
+                img_width, img_height = image.size
+                max_width = int(screen_width * 0.8)
+                max_height = int(screen_height * 0.8)
+
+                # If image is larger than screen, scale it down
+                if img_width > max_width or img_height > max_height:
+                    ratio = min(max_width / img_width, max_height / img_height)
+                    initial_width = int(img_width * ratio)
+                    initial_height = int(img_height * ratio)
+                    top.geometry(
+                        f"{initial_width}x{initial_height}+{int((screen_width - initial_width) / 2)}+{int((screen_height - initial_height) / 2)}")
+                else:
+                    # Window size = image size + some padding for controls
+                    top.geometry(
+                        f"{img_width}x{img_height + 100}+{int((screen_width - img_width) / 2)}+{int((screen_height - img_height) / 2)}")
+
+                # Store references
+                top._image = image  # Original image
+                top._current_image = image  # Currently displayed image (may be resized)
+                top._zoom_level = 1.0  # Current zoom level
+                top._pan_start_x = 0
+                top._pan_start_y = 0
+                top._pan_x = 0
+                top._pan_y = 0
+
+                # Create main frame
+                main_frame = ttk.Frame(top)
+                main_frame.pack(fill=tk.BOTH, expand=True)
+
+                # Create canvas with scrollbars
+                canvas_frame = ttk.Frame(main_frame)
+                canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+                canvas = tk.Canvas(canvas_frame, bg='gray20', highlightthickness=0)
+                v_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
+                h_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=canvas.xview)
+
+                canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+
+                # Grid layout for canvas and scrollbars
+                canvas.grid(row=0, column=0, sticky='nsew')
+                v_scrollbar.grid(row=0, column=1, sticky='ns')
+                h_scrollbar.grid(row=1, column=0, sticky='ew')
+
+                canvas_frame.grid_rowconfigure(0, weight=1)
+                canvas_frame.grid_columnconfigure(0, weight=1)
+
+                # Store canvas reference
+                top._canvas = canvas
+                top._photo = None  # Will store the PhotoImage
+
+                # Control panel
+                control_frame = ttk.Frame(main_frame)
+                control_frame.pack(fill=tk.X, padx=5, pady=2)
+
+                # Zoom controls
+                zoom_frame = ttk.Frame(control_frame)
+                zoom_frame.pack(side=tk.LEFT, padx=5)
+
+                ttk.Button(zoom_frame, text="−", width=3,
+                           command=lambda: self.zoom_image(top, 0.8)).pack(side=tk.LEFT, padx=2)
+                ttk.Button(zoom_frame, text="Fit", width=4,
+                           command=lambda: self.fit_to_window(top)).pack(side=tk.LEFT, padx=2)
+                ttk.Button(zoom_frame, text="1:1", width=4,
+                           command=lambda: self.actual_size(top)).pack(side=tk.LEFT, padx=2)
+                ttk.Button(zoom_frame, text="+", width=3,
+                           command=lambda: self.zoom_image(top, 1.25)).pack(side=tk.LEFT, padx=2)
+
+                # Zoom label
+                self.zoom_label_var = tk.StringVar(value="100%")
+                zoom_label = ttk.Label(zoom_frame, textvariable=self.zoom_label_var, width=6)
+                zoom_label.pack(side=tk.LEFT, padx=5)
+                top._zoom_label = self.zoom_label_var
+
+                # Action buttons
+                action_frame = ttk.Frame(control_frame)
+                action_frame.pack(side=tk.RIGHT, padx=5)
+
+                ttk.Button(action_frame, text="Open in viewer",
+                           command=lambda: self.open_in_default_viewer(filesystem_path)).pack(side=tk.LEFT, padx=2)
+                ttk.Button(action_frame, text="Show in folder",
+                           command=lambda: self.open_explorer_for_file(filesystem_path)).pack(side=tk.LEFT, padx=2)
+                ttk.Button(action_frame, text="Close",
+                           command=top.destroy).pack(side=tk.LEFT, padx=2)
+
+                # Status bar
+                status_frame = ttk.Frame(main_frame)
+                status_frame.pack(fill=tk.X, padx=5, pady=2)
+
+                file_info = f"{filesystem_path} | {img_width}×{img_height} | {os.path.getsize(filesystem_path) // 1024} KB"
+                status_label = ttk.Label(status_frame, text=file_info)
+                status_label.pack(side=tk.LEFT)
+
+                # Navigation info
+                nav_label = ttk.Label(status_frame, text="Mouse wheel: Zoom | Drag: Pan | Double-click: Fit")
+                nav_label.pack(side=tk.RIGHT)
+
+                # Bind events
+                canvas.bind("<Configure>", lambda e: self.on_canvas_configure(top))
+                canvas.bind("<MouseWheel>", lambda e: self.on_mouse_wheel(top, e))
+                canvas.bind("<ButtonPress-1>", lambda e: self.on_pan_start(top, e))
+                canvas.bind("<B1-Motion>", lambda e: self.on_pan_move(top, e))
+                canvas.bind("<Double-Button-1>", lambda e: self.fit_to_window(top))
+
+                # Keyboard shortcuts
+                top.bind("<plus>", lambda e: self.zoom_image(top, 1.25))
+                top.bind("<minus>", lambda e: self.zoom_image(top, 0.8))
+                top.bind("<Key-0>", lambda e: self.actual_size(top))
+                top.bind("<Key-f>", lambda e: self.fit_to_window(top))
+                top.bind("<Escape>", lambda e: top.destroy())
+
+                # Initial display
+                self.fit_to_window(top)
+
+                self.status_var.set(f"Opened: {os.path.basename(filesystem_path)}")
+
+            except Exception as e:
+                self.status_var.set(f"Error opening image: {str(e)}")
+                # Fallback to preview from database
+                if preview_data:
+                    self.show_full_image_from_preview(filename, preview_data, exif, rel_filename)
+                else:
+                    messagebox.showerror("Error", f"Cannot open image:\n{str(e)}")
 
         except Exception as e:
-            self.status_var.set(f"Error opening full image: {str(e)}")
+            self.status_var.set(f"Error: {str(e)}")
+
+    def on_canvas_configure(self, window):
+        """Handle canvas resize"""
+        if hasattr(window, '_canvas') and window._canvas:
+            # Update scroll region
+            window._canvas.configure(scrollregion=window._canvas.bbox("all"))
+            # If image is smaller than canvas, center it
+            self.center_image(window)
+
+    def zoom_image(self, window, factor):
+        """Zoom in/out on the image"""
+        if not hasattr(window, '_image') or not window._image:
+            return
+
+        # Calculate new zoom level
+        new_zoom = window._zoom_level * factor
+        if new_zoom < 0.1:  # Minimum zoom
+            new_zoom = 0.1
+        elif new_zoom > 10.0:  # Maximum zoom
+            new_zoom = 10.0
+
+        # Get current canvas dimensions
+        canvas_width = window._canvas.winfo_width()
+        canvas_height = window._canvas.winfo_height()
+
+        # Get mouse position relative to canvas
+        x = window._canvas.winfo_pointerx() - window._canvas.winfo_rootx()
+        y = window._canvas.winfo_pointery() - window._canvas.winfo_rooty()
+
+        # Calculate center point for zoom
+        center_x = x if 0 <= x <= canvas_width else canvas_width // 2
+        center_y = y if 0 <= y <= canvas_height else canvas_height // 2
+
+        # Resize image
+        img_width, img_height = window._image.size
+        new_width = int(img_width * new_zoom)
+        new_height = int(img_height * new_zoom)
+
+        resized_image = window._image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        window._current_image = resized_image
+        window._zoom_level = new_zoom
+
+        # Update display
+        self.update_image_display(window)
+
+        # Update zoom label
+        if hasattr(window, '_zoom_label'):
+            window._zoom_label.set(f"{int(new_zoom * 100)}%")
+
+        # Adjust pan to keep mouse position centered
+        if factor != 1.0:
+            # Calculate new pan position
+            scale_change = new_zoom / (window._zoom_level / factor)  # Actual factor applied
+            window._pan_x = center_x - (center_x - window._pan_x) * scale_change
+            window._pan_y = center_y - (center_y - window._pan_y) * scale_change
+
+            # Update canvas scroll
+            window._canvas.xview_moveto(window._pan_x / max(new_width, 1))
+            window._canvas.yview_moveto(window._pan_y / max(new_height, 1))
+
+    def fit_to_window(self, window):
+        """Fit image to window size"""
+        if not hasattr(window, '_image') or not window._image:
+            return
+
+        # Get canvas dimensions
+        canvas_width = window._canvas.winfo_width()
+        canvas_height = window._canvas.winfo_height()
+
+        if canvas_width <= 1 or canvas_height <= 1:
+            return
+
+        # Get image dimensions
+        img_width, img_height = window._image.size
+
+        # Calculate zoom to fit
+        zoom_width = canvas_width / img_width
+        zoom_height = canvas_height / img_height
+        new_zoom = min(zoom_width, zoom_height) * 0.95  # 95% to add some margin
+
+        # Apply zoom
+        window._zoom_level = new_zoom
+        new_width = int(img_width * new_zoom)
+        new_height = int(img_height * new_zoom)
+
+        resized_image = window._image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        window._current_image = resized_image
+
+        # Update display
+        self.update_image_display(window)
+
+        # Center image
+        self.center_image(window)
+
+        # Update zoom label
+        if hasattr(window, '_zoom_label'):
+            window._zoom_label.set(f"{int(new_zoom * 100)}%")
+
+    def actual_size(self, window):
+        """Show image at 100% zoom"""
+        if not hasattr(window, '_image') or not window._image:
+            return
+
+        window._zoom_level = 1.0
+        window._current_image = window._image
+
+        # Update display
+        self.update_image_display(window)
+
+        # Center image
+        self.center_image(window)
+
+        # Update zoom label
+        if hasattr(window, '_zoom_label'):
+            window._zoom_label.set("100%")
+
+    def update_image_display(self, window):
+        """Update the displayed image on canvas"""
+        if not hasattr(window, '_current_image') or not window._current_image:
+            return
+
+        # Clear canvas
+        window._canvas.delete("all")
+
+        # Convert PIL image to PhotoImage
+        photo = ImageTk.PhotoImage(window._current_image)
+
+        # Store reference to prevent garbage collection
+        window._photo = photo
+
+        # Display image
+        window._canvas.create_image(0, 0, anchor=tk.NW, image=photo, tags="image")
+
+        # Update scroll region
+        window._canvas.configure(scrollregion=window._canvas.bbox("all"))
+
+    def center_image(self, window):
+        """Center the image on canvas"""
+        if not hasattr(window, '_current_image') or not window._current_image:
+            return
+
+        # Get dimensions
+        img_width, img_height = window._current_image.size
+        canvas_width = window._canvas.winfo_width()
+        canvas_height = window._canvas.winfo_height()
+
+        if canvas_width <= 1 or canvas_height <= 1:
+            return
+
+        # Calculate center position
+        if img_width < canvas_width:
+            window._pan_x = (canvas_width - img_width) // 2
+        else:
+            window._pan_x = 0
+
+        if img_height < canvas_height:
+            window._pan_y = (canvas_height - img_height) // 2
+        else:
+            window._pan_y = 0
+
+        # Update canvas scroll
+        window._canvas.xview_moveto(window._pan_x / max(img_width, 1))
+        window._canvas.yview_moveto(window._pan_y / max(img_height, 1))
+
+    def on_mouse_wheel(self, window, event):
+        """Handle mouse wheel for zooming"""
+        if event.delta > 0:
+            self.zoom_image(window, 1.25)
+        else:
+            self.zoom_image(window, 0.8)
+
+    def on_pan_start(self, window, event):
+        """Start panning"""
+        window._pan_start_x = event.x
+        window._pan_start_y = event.y
+        window._canvas.scan_mark(event.x, event.y)
+
+    def on_pan_move(self, window, event):
+        """Move during panning"""
+        window._canvas.scan_dragto(event.x, event.y, gain=1)
+
+        # Update pan position
+        img_width, img_height = window._current_image.size
+        window._pan_x = int(window._canvas.canvasx(0))
+        window._pan_y = int(window._canvas.canvasy(0))
+
+    def show_full_image_from_preview(self, filename, preview_data, exif, rel_filename):
+        """Fallback: show image from database preview with auto-resizing"""
+        try:
+            image = Image.open(io.BytesIO(preview_data))
+
+            # Apply EXIF orientation if available
+            if exif:
+                image = self.apply_exif_orientation(image, exif)
+
+            top = tk.Toplevel(self.root)
+            top.title(f"Full Size (from DB) - {os.path.basename(filename)}")
+
+            # Get screen dimensions
+            screen_width = top.winfo_screenwidth()
+            screen_height = top.winfo_screenheight()
+
+            # Calculate initial window size
+            img_width, img_height = image.size
+            max_width = int(screen_width * 0.8)
+            max_height = int(screen_height * 0.8)
+
+            if img_width > max_width or img_height > max_height:
+                ratio = min(max_width / img_width, max_height / img_height)
+                initial_width = int(img_width * ratio)
+                initial_height = int(img_height * ratio)
+                top.geometry(
+                    f"{initial_width}x{initial_height}+{int((screen_width - initial_width) / 2)}+{int((screen_height - initial_height) / 2)}")
+            else:
+                top.geometry(
+                    f"{img_width}x{img_height + 100}+{int((screen_width - img_width) / 2)}+{int((screen_height - img_height) / 2)}")
+
+            # Store references
+            top._image = image
+            top._current_image = image
+            top._zoom_level = 1.0
+
+            # Create main frame
+            main_frame = ttk.Frame(top)
+            main_frame.pack(fill=tk.BOTH, expand=True)
+
+            # Create canvas with scrollbars
+            canvas_frame = ttk.Frame(main_frame)
+            canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+            canvas = tk.Canvas(canvas_frame, bg='gray20', highlightthickness=0)
+            v_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
+            h_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=canvas.xview)
+
+            canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+
+            canvas.grid(row=0, column=0, sticky='nsew')
+            v_scrollbar.grid(row=0, column=1, sticky='ns')
+            h_scrollbar.grid(row=1, column=0, sticky='ew')
+
+            canvas_frame.grid_rowconfigure(0, weight=1)
+            canvas_frame.grid_columnconfigure(0, weight=1)
+
+            top._canvas = canvas
+            top._photo = None
+
+            # Control panel
+            control_frame = ttk.Frame(main_frame)
+            control_frame.pack(fill=tk.X, padx=5, pady=2)
+
+            # Zoom controls
+            zoom_frame = ttk.Frame(control_frame)
+            zoom_frame.pack(side=tk.LEFT, padx=5)
+
+            ttk.Button(zoom_frame, text="−", width=3,
+                       command=lambda: self.zoom_image(top, 0.8)).pack(side=tk.LEFT, padx=2)
+            ttk.Button(zoom_frame, text="Fit", width=4,
+                       command=lambda: self.fit_to_window(top)).pack(side=tk.LEFT, padx=2)
+            ttk.Button(zoom_frame, text="1:1", width=4,
+                       command=lambda: self.actual_size(top)).pack(side=tk.LEFT, padx=2)
+            ttk.Button(zoom_frame, text="+", width=3,
+                       command=lambda: self.zoom_image(top, 1.25)).pack(side=tk.LEFT, padx=2)
+
+            # Zoom label
+            self.zoom_label_var = tk.StringVar(value="100%")
+            zoom_label = ttk.Label(zoom_frame, textvariable=self.zoom_label_var, width=6)
+            zoom_label.pack(side=tk.LEFT, padx=5)
+            top._zoom_label = self.zoom_label_var
+
+            # Close button
+            ttk.Button(control_frame, text="Close",
+                       command=top.destroy).pack(side=tk.RIGHT, padx=5)
+
+            # Warning frame
+            warning_frame = ttk.Frame(main_frame)
+            warning_frame.pack(fill=tk.X, padx=5, pady=2)
+
+            warning_label = ttk.Label(warning_frame,
+                                      text=f"⚠ Showing preview from database. Original file not found: {rel_filename}",
+                                      foreground="orange")
+            warning_label.pack()
+
+            # Bind events
+            canvas.bind("<Configure>", lambda e: self.on_canvas_configure(top))
+            canvas.bind("<MouseWheel>", lambda e: self.on_mouse_wheel(top, e))
+            canvas.bind("<Double-Button-1>", lambda e: self.fit_to_window(top))
+
+            # Keyboard shortcuts
+            top.bind("<plus>", lambda e: self.zoom_image(top, 1.25))
+            top.bind("<minus>", lambda e: self.zoom_image(top, 0.8))
+            top.bind("<Key-0>", lambda e: self.actual_size(top))
+            top.bind("<Key-f>", lambda e: self.fit_to_window(top))
+            top.bind("<Escape>", lambda e: top.destroy())
+
+            # Initial display
+            self.fit_to_window(top)
+
+            self.status_var.set(f"Opened preview from database: {os.path.basename(filename)}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot open image preview:\n{str(e)}")
+
+    def open_in_default_viewer(self, filepath):
+        """Open image in default system viewer"""
+        try:
+            if os.name == 'nt':
+                os.startfile(filepath)
+            else:
+                # For Linux/Mac
+                import subprocess
+                subprocess.Popen(['xdg-open', filepath])
+            self.status_var.set(f"Opened in default viewer: {os.path.basename(filepath)}")
+        except Exception as e:
+            self.status_var.set(f"Error opening in viewer: {str(e)}")
+
+    def open_explorer_for_file(self, filepath):
+        """Open file in explorer (alternative to open_explorer)"""
+        try:
+            if os.name == 'nt':
+                import subprocess
+                subprocess.Popen(f'explorer /select,"{filepath}"')
+                self.status_var.set(f"Opened explorer: {filepath}")
+            else:
+                # For Linux
+                import subprocess
+                file_dir = os.path.dirname(filepath)
+                subprocess.Popen(['xdg-open', file_dir])
+                self.status_var.set(f"Opened folder: {file_dir}")
+        except Exception as e:
+            self.status_var.set(f"Error opening explorer: {str(e)}")
 
     def apply_exif_orientation(self, image, exif_json):
         """Apply EXIF orientation to correctly rotate the image"""
