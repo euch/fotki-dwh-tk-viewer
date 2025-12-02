@@ -220,7 +220,7 @@ class MediaBrowser:
 
                 query = f"""
                 SELECT abs_filename, rel_filename, preview, latest_caption, exif 
-                FROM dm.images_collection
+                FROM dm.col_images
                 {where_clause}
                 ORDER BY rel_filename desc
                 LIMIT %s OFFSET %s
@@ -595,7 +595,7 @@ class MediaBrowser:
                 cur = self.conn.cursor()
                 cur.execute("""
                         SELECT rel_filename, preview, latest_caption, exif 
-                        FROM dm.images_collection 
+                        FROM dm.col_images 
                         WHERE abs_filename = %s
                     """, (abs_filename,))
                 result = cur.fetchone()
